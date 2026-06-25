@@ -9,7 +9,7 @@ library(org.Hs.eg.db)
 setwd("~/Research/Data/Fetal_Brain/")
 
 # Setup Output Directories
-output <- "~/Research/Figures_and_Results/Fetal_Brain"
+output <- "~/Research/Figures_and_Results/Fetal_Brain/"
 if (!dir.exists(output)) {
   dir.create(output, recursive = TRUE)
 }
@@ -243,6 +243,90 @@ ggsave(file.path(output, "PCA_post_normalization.pdf"),
        pca_norm, width = 8, height = 6, dpi = 1000, device = cairo_pdf)
 #================== End of PCA ================================#
 
+#===================================#
+# Remove outlier within spinal cord #
+#===================================#
+outlier_lib <- "08TF001617_S77"
+
+# Defensive check — fail loudly if the library is already gone
+stopifnot(outlier_lib %in% colnames(data))
+
+# Drop from counts, metadata, and coldata
+data     <- data[,    colnames(data)    != outlier_lib]
+metadata <- metadata[rownames(metadata) != outlier_lib, ]
+coldata  <- coldata[ rownames(coldata)  != outlier_lib, ]
+
+# Re-verify alignment
+stopifnot(all(colnames(data) == rownames(metadata)))
+stopifnot(all(colnames(data) == rownames(coldata)))
+
+# Cohort balance after exclusion
+message(sprintf("After exclusion: %d libraries × %d genes",
+                ncol(data), nrow(data)))
+cat("\nCondition counts:\n");                print(table(coldata$Condition))
+cat("\nCase pairing (n libraries per case):\n");  print(table(coldata$Case))
+
+#=========================================#
+# Re-build DESeqDataSet on n = 39          #
+#=========================================#
+dds <- DESeqDataSetFromMatrix(countData = data,
+                              colData   = coldata,
+                              design    = ~ Condition)
+dds <- DESeq(dds)
+vsd <- vst(dds, blind = FALSE)
+
+resultsNames(dds)
+
+#===========================#
+# PCA after outlier removal #
+#===========================#
+pca_post <- prcomp(t(assay(vsd)), center = TRUE, scale. = FALSE)
+ve_post  <- pca_post$sdev^2 / sum(pca_post$sdev^2)
+
+pc_post <- as.data.frame(pca_post$x) |>
+  tibble::rownames_to_column("library_id") |>
+  dplyr::left_join(tibble::rownames_to_column(metadata, "library_id"),
+                   by = "library_id") |>
+  dplyr::mutate(
+    Tissue = factor(dplyr::recode(tissue,
+                                  "frontal_cortex" = "Frontal cortex",
+                                  "spinal_cord"    = "Spinal cord"),
+                    levels = c("Frontal cortex", "Spinal cord")),
+    Group  = factor(dplyr::recode(group,
+                                  "control"            = "Normal morphology",
+                                  "neural_tube_defect" = "Neural tube defect"),
+                    levels = c("Normal morphology", "Neural tube defect")))
+
+pc_lab_post <- function(i) sprintf("PC%d  (%.1f%%)", i, 100 * ve_post[i])
+
+pca_norm <- ggplot(pc_post, aes(PC1, PC2)) +
+  stat_ellipse(aes(group = interaction(Tissue, Group), fill = Group),
+               geom = "polygon", alpha = 0.08, colour = NA, level = 0.80,
+               show.legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             colour = "grey70", linewidth = 0.3) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             colour = "grey70", linewidth = 0.3) +
+  geom_point(aes(shape = Tissue, fill = Group),
+             size = 3.8, stroke = 0.8, colour = "black") +
+  scale_shape_manual(values = c("Frontal cortex" = 21, "Spinal cord" = 24),
+                     name   = "Tissue",
+                     guide  = guide_legend(
+                       order = 1,
+                       override.aes = list(fill = "grey60", colour = "black",
+                                           size = 3.6))) +
+  scale_fill_manual(values = group_pal, name = "Group",
+                    guide  = guide_legend(
+                      order = 2,
+                      override.aes = list(shape = 21, colour = "black",
+                                          size = 3.6))) +
+  labs(x = pc_lab_post(1), y = pc_lab_post(2)) +
+  theme_pub
+
+ggsave(file.path(output, "PCA_post_normalization_n39_Outlier_Removed.pdf"),
+       pca_norm, width = 8, height = 6, dpi = 1000, device = cairo_pdf)
+#==================== End of PCA =======================#
+
 # Data has Ensembl IDs. So we map them onto gene symbols
 # Strip the Ensembl version suffix if present (ENSG00000123456.7 -> ENSG00000123456).
 # org.Hs.eg.db keys on the unversioned ID
@@ -250,10 +334,25 @@ annotate_res <- function(res) {
   df <- as.data.frame(res) |>
     tibble::rownames_to_column("gene_id") |>
     dplyr::arrange(padj)
+  
+  # Strip the Ensembl version suffix
   df$ensembl_id  <- sub("\\..*$", "", df$gene_id)
+  
+  # Map using org.Hs.eg.db
   df$gene_symbol <- AnnotationDbi::mapIds(
     org.Hs.eg.db, keys = df$ensembl_id, column = "SYMBOL",
     keytype = "ENSEMBL", multiVals = "first")
+  
+  # Manual patch for C4A-AS1, with a fallback to Ensembl ID for any other NAs
+  df <- df |>
+    dplyr::mutate(
+      gene_symbol = dplyr::case_when(
+        ensembl_id == "ENSG00000233627" ~ "C4A-AS1",
+        is.na(gene_symbol) | gene_symbol == "" ~ ensembl_id,
+        TRUE ~ gene_symbol
+      )
+    )
+  
   df
 }
 
@@ -261,32 +360,32 @@ annotate_res <- function(res) {
 # A. NTD vs Normal morphology, WITHIN frontal cortex
 res_group_FC <- results(dds, contrast = c("Condition",
   "Neural_tube_defect_Frontal_cortex", "Normal_morphology_Frontal_cortex"),
-  alpha = 0.05)
+  alpha = 0.01)
 
 # B. NTD vs Normal morphology, WITHIN spinal cord
 res_group_SC <- results(dds, contrast = c("Condition",
   "Neural_tube_defect_Spinal_cord", "Normal_morphology_Spinal_cord"),
-  alpha = 0.05)
+  alpha = 0.01)
 
 # C. Spinal cord vs Frontal cortex, WITHIN normal morphology
 res_tissue_NM <- results(dds, contrast = c("Condition",
   "Normal_morphology_Spinal_cord", "Normal_morphology_Frontal_cortex"),
-  alpha = 0.05)
+  alpha = 0.01)
 
 # D. Spinal cord vs Frontal cortex, WITHIN NTD
 res_tissue_NTD <- results(dds, contrast = c("Condition",
   "Neural_tube_defect_Spinal_cord", "Neural_tube_defect_Frontal_cortex"),
-  alpha = 0.05)
+  alpha = 0.01)
 
 # E. Overall NTD vs Normal morphology (averaged across both tissues).
 # Numeric contrast vector in resultsNames(dds) order — positions are:
 #   1 Intercept | 2 Normal_SC | 3 NTD_FC | 4 NTD_SC
 res_group_overall <- results(dds, contrast = c(0, -0.5, 0.5, 0.5),
-                             alpha = 0.05)
+                             alpha = 0.01)
 
 # F. Overall Spinal cord vs Frontal cortex (averaged across both groups)
 res_tissue_overall <- results(dds, contrast = c(0,  0.5, -0.5, 0.5),
-                              alpha = 0.05)
+                              alpha = 0.01)
 # Annotate, and summarise DEGs 
 contrasts <- list(
   group_FC       = res_group_FC,        # NTD vs Normal in FC
@@ -299,8 +398,8 @@ contrasts <- list(
 
 contrasts_df <- lapply(contrasts, annotate_res)
 
-# Quick summary: how many genes pass FDR < 0.05 per contrast
-n_de <- sapply(contrasts_df, function(d) sum(d$padj < 0.05, na.rm = TRUE))
+# Quick summary: how many genes pass FDR < 0.01 per contrast
+n_de <- sapply(contrasts_df, function(d) sum(d$padj < 0.01, na.rm = TRUE))
 print(n_de)
 
 # Write each to disk for the supplementary
@@ -317,8 +416,8 @@ volcano_df <- res_df |>
   dplyr::filter(!is.na(padj)) |>
   dplyr::mutate(
     Direction = dplyr::case_when(
-      padj < 0.05 & log2FoldChange > 0 ~ "Up in NTD",
-      padj < 0.05 & log2FoldChange < 0 ~ "Down in NTD",
+      padj < 0.01 & log2FoldChange > 0 ~ "Up in NTD",
+      padj < 0.01 & log2FoldChange < 0 ~ "Down in NTD",
       TRUE                              ~ "Not significant"),
     Direction = factor(Direction,
                        levels = c("Up in NTD", "Down in NTD", "Not significant")))
@@ -336,7 +435,7 @@ direction_pal <- c("Up in NTD"       = "#D55E00",
 p_volcano <- ggplot(volcano_df, aes(log2FoldChange, -log10(padj))) +
   geom_vline(xintercept = 0, linetype = "dashed",
              colour = "grey80", linewidth = 0.3) +
-  geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed",
              colour = "grey50", linewidth = 0.4) +
   geom_point(aes(colour = Direction,
                  size   = Direction != "Not significant",
@@ -358,23 +457,3 @@ p_volcano <- ggplot(volcano_df, aes(log2FoldChange, -log10(padj))) +
 
 ggsave(file.path(output, "Volcano_NTD_vs_NM_spinal_cord.pdf"),
        p_volcano, width = 7.5, height = 6, dpi = 1000, device = cairo_pdf)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- 
